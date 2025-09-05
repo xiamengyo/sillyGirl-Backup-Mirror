@@ -1,0 +1,41 @@
+name: Cleanup Workflow Runs
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # 每周一凌晨2点运行 (UTC时间)
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 7     # 保留最近7天的运行记录
+          keep_minimum_runs: 20  # 至少保留20条运行记录
+
+      - name: Cleanup old releases
+        run: |
+          # 获取所有release信息
+          releases=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100")
+          
+          # 计算7天前的时间戳
+          seven_days_ago=$(date -d "7 days ago" +%Y-%m-%dT%H:%M:%SZ)
+          
+          # 遍历所有release
+          echo "$releases" | jq -r '.[] | "\(.id)|\(.created_at)|\(.tag_name)"' | while IFS='|' read -r id created_at tag_name; do
+            # 如果release创建时间早于7天前，则删除
+            if [[ "$created_at" < "$seven_days_ago" ]]; then
+              echo "Deleting old release: $tag_name (created at $created_at)"
+              curl -s -X DELETE \
+                -H "Authorization: token ${{ secrets.PAT }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/$id"
+            fi
+          done

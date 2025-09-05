@@ -1,0 +1,130 @@
+name: Backup Releases
+
+on:
+  repository_dispatch:
+    types: [backup_releases]
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Get releases list
+      id: get_releases
+      run: |
+        # 获取所有releases（按创建时间升序，最旧的在前）
+        releases=$(curl -s -H "Authorization: token ${{ secrets.PAT }}" \
+          "https://api.github.com/repos/callacat/sillyGirl-Backup/releases?per_page=100&direction=asc" | \
+          jq -r '.[] | "\(.id)|\(.tag_name)|\(.published_at)"')
+        
+        # 保存到文件供后续步骤使用
+        echo "$releases" > releases_list.txt
+        
+        # 计算总release数量
+        total=$(echo "$releases" | wc -l)
+        echo "total_releases=$total" >> $GITHUB_ENV
+
+    - name: Determine batch range
+      id: determine_batch
+      run: |
+        # 读取上次备份进度
+        if [ -f "backup_progress.txt" ]; then
+          last_processed=$(cat backup_progress.txt)
+          echo "Last processed index: $last_processed"
+        else
+          last_processed=0
+          echo "Starting from beginning"
+        fi
+        
+        # 计算本次处理的起始和结束索引
+        start_index=$last_processed
+        end_index=$((start_index + 5))  # 每次处理5个
+        
+        # 确保不超过总数
+        if [ $end_index -gt ${{ env.total_releases }} ]; then
+          end_index=${{ env.total_releases }}
+        fi
+        
+        echo "start_index=$start_index" >> $GITHUB_ENV
+        echo "end_index=$end_index" >> $GITHUB_ENV
+        echo "Processing releases from $start_index to $end_index"
+
+    - name: Process batch of releases
+      id: process_batch
+      run: |
+        # 读取releases列表
+        mapfile -t releases < releases_list.txt
+        
+        # 处理当前批次的releases
+        for i in $(seq ${{ env.start_index }} $(({{ env.end_index }} - 1))); do
+          if [ $i -ge ${#releases[@]} ]; then
+            break
+          fi
+          
+          IFS='|' read -r release_id tag_name published_at <<< "${releases[$i]}"
+          echo "Processing release $release_id: $tag_name"
+          
+          # 获取release详情
+          release_info=$(curl -s -H "Authorization: token ${{ secrets.PAT }}" \
+            "https://api.github.com/repos/callacat/sillyGirl-Backup/releases/$release_id")
+          
+          # 创建本地tag
+          git tag "$tag_name" || echo "Tag may already exist"
+          
+          # 创建release
+          release_name=$(echo "$release_info" | jq -r '.name')
+          release_body=$(echo "$release_info" | jq -r '.body')
+          
+          # 创建release
+          response=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\": \"$tag_name\", \"name\": \"$release_name\", \"body\": \"$release_body\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases")
+          
+          upload_url=$(echo "$response" | jq -r '.upload_url' | sed 's/{.*}//')
+          
+          # 下载并上传assets
+          assets=$(echo "$release_info" | jq -r '.assets[] | .url')
+          for asset_url in $assets; do
+            asset_name=$(echo "$asset_url" | awk -F'/' '{print $NF}')
+            echo "Downloading asset: $asset_name"
+            
+            # 下载asset
+            curl -s -L -H "Authorization: token ${{ secrets.PAT }}" \
+              -H "Accept: application/octet-stream" \
+              "$asset_url" -o "$asset_name"
+            
+            # 上传asset
+            if [ -f "$asset_name" ]; then
+              curl -s -X POST \
+                -H "Authorization: token ${{ secrets.PAT }}" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$asset_name" \
+                "$upload_url?name=$asset_name"
+              
+              # 清理临时文件
+              rm -f "$asset_name"
+            fi
+          done
+          
+          # 记录进度
+          echo "$release_id" > last_backup.txt
+        done
+        
+        # 更新进度
+        echo "${{ env.end_index }}" > backup_progress.txt
+
+    - name: Commit and push progress
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add last_backup.txt backup_progress.txt
+        git commit -m "Update backup progress" || echo "No changes to commit"
+        git push origin HEAD:main
