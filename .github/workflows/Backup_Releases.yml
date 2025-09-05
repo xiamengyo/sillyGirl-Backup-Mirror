@@ -47,8 +47,8 @@ jobs:
         end_index=$((start_index + 5))  # 每次处理5个
         
         # 确保不超过总数
-        if [ $end_index -gt ${{ env.total_releases }} ]; then
-          end_index=${{ env.total_releases }}
+        if [ $end_index -gt $total ]; then
+          end_index=$total
         fi
         
         echo "start_index=$start_index" >> $GITHUB_ENV
@@ -62,7 +62,7 @@ jobs:
         mapfile -t releases < releases_list.txt
         
         # 处理当前批次的releases
-        for i in $(seq ${{ env.start_index }} $(({{ env.end_index }} - 1))); do
+        for i in $(seq $start_index $(($end_index - 1))); do
           if [ $i -ge ${#releases[@]} ]; then
             break
           fi
@@ -119,7 +119,7 @@ jobs:
         done
         
         # 更新进度
-        echo "${{ env.end_index }}" > backup_progress.txt
+        echo "$end_index" > backup_progress.txt
 
     - name: Commit and push progress
       run: |
@@ -127,4 +127,5 @@ jobs:
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git add last_backup.txt backup_progress.txt
         git commit -m "Update backup progress" || echo "No changes to commit"
-        git push origin HEAD:main
+        # 使用PAT进行推送
+        git push https://xiamengyo:${{ secrets.PAT }}@github.com/xiamengyo/sillyGirl-Backup-Mirror.git HEAD:main
