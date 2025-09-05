@@ -30,6 +30,35 @@ jobs:
         total=$(echo "$releases" | wc -l)
         echo "total_releases=$total" >> $GITHUB_ENV
 
+    - name: Cleanup previous incorrect backups
+      id: cleanup_backups
+      run: |
+        echo "Checking for incorrectly named backup files..."
+        
+        # 获取当前仓库的所有releases
+        my_releases=$(curl -s -H "Authorization: token ${{ secrets.PAT }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100")
+        
+        # 查找文件名仅为数字的assets
+        echo "$my_releases" | jq -r '.[] | "\(.id)|\(.tag_name)"' | while IFS='|' read -r release_id tag_name; do
+          assets=$(curl -s -H "Authorization: token ${{ secrets.PAT }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets" | \
+            jq -r '.[] | "\(.id)|\(.name)"')
+          
+          for asset in $assets; do
+            IFS='|' read -r asset_id asset_name <<< "$asset"
+            # 检查文件名是否仅为数字
+            if [[ "$asset_name" =~ ^[0-9]+$ ]]; then
+              echo "Deleting incorrectly named asset: $asset_name (ID: $asset_id) from release: $tag_name"
+              
+              # 删除错误命名的asset
+              curl -s -X DELETE \
+                -H "Authorization: token ${{ secrets.PAT }}" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id"
+            fi
+          done
+        done
+
     - name: Determine batch range
       id: determine_batch
       run: |
@@ -81,33 +110,97 @@ jobs:
           release_name=$(echo "$release_info" | jq -r '.name')
           release_body=$(echo "$release_info" | jq -r '.body')
           
-          # 创建release
-          response=$(curl -s -X POST \
-            -H "Authorization: token ${{ secrets.PAT }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"$tag_name\", \"name\": \"$release_name\", \"body\": \"$release_body\"}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases")
+          # 检查是否已存在同名release
+          existing_release=$(curl -s -H "Authorization: token ${{ secrets.PAT }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag_name" | jq -r '.id')
+          
+          if [ "$existing_release" != "null" ]; then
+            echo "Release $tag_name already exists, updating..."
+            # 更新现有release
+            response=$(curl -s -X PATCH \
+              -H "Authorization: token ${{ secrets.PAT }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"$release_name\", \"body\": \"$release_body\"}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$existing_release")
+          else
+            # 创建新release
+            response=$(curl -s -X POST \
+              -H "Authorization: token ${{ secrets.PAT }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\": \"$tag_name\", \"name\": \"$release_name\", \"body\": \"$release_body\"}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases")
+          fi
           
           upload_url=$(echo "$response" | jq -r '.upload_url' | sed 's/{.*}//')
           
-          # 下载并上传assets
-          assets=$(echo "$release_info" | jq -r '.assets[] | .url')
-          for asset_url in $assets; do
-            asset_name=$(echo "$asset_url" | awk -F'/' '{print $NF}')
+          # 获取assets信息（包括名称和下载URL）
+          assets=$(echo "$release_info" | jq -r '.assets[] | "\(.name)|\(.url)|\(.id)"')
+          for asset in $assets; do
+            IFS='|' read -r asset_name asset_url asset_orig_id <<< "$asset"
             echo "Downloading asset: $asset_name"
             
-            # 下载asset
+            # 下载asset，使用原始文件名
             curl -s -L -H "Authorization: token ${{ secrets.PAT }}" \
               -H "Accept: application/octet-stream" \
               "$asset_url" -o "$asset_name"
             
-            # 上传asset
+            # 验证文件完整性
             if [ -f "$asset_name" ]; then
-              curl -s -X POST \
+              # 计算下载文件的SHA256哈希值
+              downloaded_hash=$(sha256sum "$asset_name" | awk '{print $1}')
+              echo "Downloaded file hash: $downloaded_hash"
+              
+              # 尝试从原始release获取哈希值
+              # 首先检查是否有专门的checksum文件
+              checksum_asset=$(echo "$release_info" | jq -r '.assets[] | select(.name | test("(?i)checksum|sha256|sha1|md5")) | "\(.name)|\(.url)"' | head -n1)
+              
+              if [ -n "$checksum_asset" ]; then
+                IFS='|' read -r checksum_name checksum_url <<< "$checksum_asset"
+                echo "Found checksum file: $checksum_name"
+                
+                # 下载checksum文件
+                curl -s -L -H "Authorization: token ${{ secrets.PAT }}" \
+                  -H "Accept: application/octet-stream" \
+                  "$checksum_url" -o "checksum_temp.txt"
+                
+                # 在checksum文件中查找当前文件的哈希值
+                expected_hash=$(grep -i "$asset_name" "checksum_temp.txt" | grep -oE '[a-f0-9]{64}' | head -n1)
+                rm -f "checksum_temp.txt"
+                
+                if [ -n "$expected_hash" ]; then
+                  echo "Expected hash from checksum file: $expected_hash"
+                  if [ "$downloaded_hash" != "$expected_hash" ]; then
+                    echo "ERROR: Hash mismatch for $asset_name"
+                    echo "Expected: $expected_hash"
+                    echo "Got: $downloaded_hash"
+                    # 可以选择退出或继续处理其他文件
+                    # exit 1
+                  else
+                    echo "Hash verification passed for $asset_name"
+                  fi
+                else
+                  echo "No hash found for $asset_name in checksum file"
+                fi
+              else
+                echo "No checksum file found, skipping hash verification"
+              fi
+              
+              # 上传asset，使用原始文件名
+              echo "Uploading asset: $asset_name"
+              upload_response=$(curl -s -w "%{http_code}" -X POST \
                 -H "Authorization: token ${{ secrets.PAT }}" \
                 -H "Content-Type: application/octet-stream" \
                 --data-binary @"$asset_name" \
-                "$upload_url?name=$asset_name"
+                "$upload_url?name=$asset_name")
+              
+              # 检查上传状态
+              http_code=${upload_response: -3}
+              if [ "$http_code" -ne 201 ]; then
+                echo "ERROR: Failed to upload $asset_name (HTTP $http_code)"
+                echo "Response: ${upload_response%???}"
+              else
+                echo "Successfully uploaded $asset_name"
+              fi
               
               # 清理临时文件
               rm -f "$asset_name"
